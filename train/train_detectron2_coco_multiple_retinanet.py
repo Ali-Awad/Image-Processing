@@ -16,56 +16,54 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 datasets = ["ACDC", "AutoEnhancer", "BayesianRetinex", "ICSP", "Original", 
             "PCDE", "Semi_UIR", "TEBCF", "TUDA", "USUIR"]
 
-class EarlyStoppingHook(hooks.HookBase):
-    def __init__(self, trainer, patience=5, metric="bbox/AP", mode="max"):
-        """
-        Implements early stopping for Detectron2 training.
+# class EarlyStoppingHook(hooks.HookBase):
+#     def __init__(self, trainer, patience=5, metric="bbox/AP", mode="max"):
+#         """
+#         Implements early stopping for Detectron2 training.
         
-        :param trainer: The trainer object.
-        :param patience: Number of evaluation cycles to wait for improvement.
-        :param metric: The metric to track (default is COCO bbox AP).
-        :param mode: "max" means higher is better (AP metric).
-        """
-        self.trainer = trainer
-        self.patience = patience
-        self.metric = metric
-        self.mode = mode
-        self.best_metric = None
-        self.counter = 0
+#         :param trainer: The trainer object.
+#         :param patience: Number of evaluation cycles to wait for improvement.
+#         :param metric: The metric to track (default is COCO bbox AP).
+#         :param mode: "max" means higher is better (AP metric).
+#         """
+#         self.trainer = trainer
+#         self.patience = patience
+#         self.metric = metric
+#         self.mode = mode
+#         self.best_metric = None
+#         self.counter = 0
 
-    def after_step(self):
-        if self.trainer.iter % self.trainer.cfg.TEST.EVAL_PERIOD == 0:
-            evaluator = COCOEvaluator(self.trainer.cfg.DATASETS.TEST[0], self.trainer.cfg, False)
-            val_loader = build_detection_test_loader(self.trainer.cfg, self.trainer.cfg.DATASETS.TEST[0])
-            results = inference_on_dataset(self.trainer.model, val_loader, evaluator)
+#     def after_step(self):
+#         # Only check at evaluation steps
+#         if self.trainer.iter % self.trainer.cfg.TEST.EVAL_PERIOD == 0:
+#             eval_results = self.trainer.storage.latest()
+#             current_metric = eval_results.get(self.metric, None)
 
-            # Get the validation metric (bbox/AP in COCO format)
-            current_metric = results["bbox"]["AP"] if "bbox" in results else 0.0
+#             if current_metric is None:
+#                 return  # Skip if metric not found
 
-            if self.best_metric is None or (
-                (self.mode == "max" and current_metric > self.best_metric) or 
-                (self.mode == "min" and current_metric < self.best_metric)
-            ):
-                self.best_metric = current_metric
-                self.counter = 0  # Reset patience counter
-                print(f"New best metric: {current_metric:.4f}")
-            else:
-                self.counter += 1
-                print(f"No improvement in {self.metric} for {self.counter} evaluations.")
+#             # Determine if the model has improved
+#             if self.best_metric is None or (
+#                 (self.mode == "max" and current_metric > self.best_metric) or 
+#                 (self.mode == "min" and current_metric < self.best_metric)
+#             ):
+#                 self.best_metric = current_metric
+#                 self.counter = 0  # Reset counter
+#             else:
+#                 self.counter += 1  # No improvement
 
-            if self.counter >= self.patience:
-                comm.synchronize()  # Ensure all workers are synchronized
-                self.trainer.storage.put_scalar("early_stopping", 1)
-                self.trainer.checkpointer.save("model_early_stop")
-                print(f"Stopping training early after {self.counter} evaluations without improvement.")
-                raise hooks.StopTraining()
-
+#             # Stop training if patience is exceeded
+#             if self.counter >= self.patience:
+#                 comm.synchronize()  # Ensure all workers are synchronized
+#                 self.trainer.storage.put_scalar("early_stopping", 1)
+#                 self.trainer.checkpointer.save("model_early_stop")
+#                 print(f"Stopping training early after {self.counter} evaluations without improvement.")
+#                 raise hooks.StopTraining()
 
 class CustomTrainer(DefaultTrainer):
-    def __init__(self, cfg, patience=5):
+    def __init__(self, cfg):
         super().__init__(cfg)
-        self.best_metric = 0.0
-        self.patience = patience  # Store patience value for early stopping
+        self.best_metric = 0.0  # Store the best metric (AP)
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name):
@@ -74,28 +72,30 @@ class CustomTrainer(DefaultTrainer):
     def build_hooks(self):
         hooks_list = super().build_hooks()
         hooks_list.append(BestModelSaverHook(self))
-        hooks_list.append(EarlyStoppingHook(self, patience=self.patience))  # Add early stopping hook
         return hooks_list
 
 
 class BestModelSaverHook(hooks.HookBase):
     def __init__(self, trainer):
         self.trainer = trainer
-        self.best_metric = 0.0
+        self.best_metric = 0.0  # Track the best metric
 
     def after_step(self):
+        # Evaluate only at the set interval
         if self.trainer.iter % self.trainer.cfg.TEST.EVAL_PERIOD == 0:
             evaluator = COCOEvaluator(self.trainer.cfg.DATASETS.TEST[0], self.trainer.cfg, False)
             val_loader = build_detection_test_loader(self.trainer.cfg, self.trainer.cfg.DATASETS.TEST[0])
             results = inference_on_dataset(self.trainer.model, val_loader, evaluator)
 
+            # Get the validation metric (bbox/AP in COCO format)
             metric = results["bbox"]["AP"] if "bbox" in results else 0.0
 
+            # Save the best model if AP improves
             if metric > self.best_metric:
                 self.best_metric = metric
                 print(f"New best model found with AP: {metric:.4f}! Saving...")
                 checkpointer = DetectionCheckpointer(self.trainer.model, save_dir=self.trainer.cfg.OUTPUT_DIR)
-                checkpointer.save("model_best")
+                checkpointer.save("model_best")  # Saves as model_best.pth
 
 for dataset in datasets:
     print(f"Training on dataset: {dataset}")
@@ -118,7 +118,7 @@ for dataset in datasets:
     cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/retinanet_R_50_FPN_3x/190397829/model_final_5bd44e.pkl"
     cfg.SOLVER.IMS_PER_BATCH = 8
     cfg.SOLVER.BASE_LR = 0.024
-    cfg.SOLVER.MAX_ITER = 150000 
+    cfg.SOLVER.MAX_ITER = 200000 
     cfg.SOLVER.WARMUP_ITERS = 10000
     cfg.TEST.EVAL_PERIOD = 2000  
     cfg.SOLVER.WEIGHT_DECAY = 0.0005
@@ -130,6 +130,6 @@ for dataset in datasets:
     cfg.OUTPUT_DIR = f"output_retinanet/{dataset}"
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
-    trainer = CustomTrainer(cfg, patience=50)
+    trainer = CustomTrainer(cfg)
     trainer.resume_or_load(resume=False)
     trainer.train()
